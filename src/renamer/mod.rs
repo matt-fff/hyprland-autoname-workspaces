@@ -23,6 +23,7 @@ pub struct Renamer {
     known_workspaces: Mutex<HashSet<i32>>,
     cfg: Mutex<Config>,
     args: Args,
+    workspace_strings_cache: Mutex<HashMap<i32, String>>, // Add cache field
 }
 
 #[derive(Clone, Eq, Debug)]
@@ -75,6 +76,7 @@ impl Renamer {
             known_workspaces: Mutex::new(HashSet::default()),
             cfg: Mutex::new(cfg),
             args,
+            workspace_strings_cache: Mutex::new(HashMap::new()), // Initialize cache
         })
     }
 
@@ -93,14 +95,27 @@ impl Renamer {
 
         // Get workspaces based on open clients
         let workspaces = self.get_workspaces_from_clients(clients, active_client, config)?;
+        
+        // Get workspace IDs before moving workspaces
+        let workspace_ids: HashSet<_> = workspaces.iter().map(|w| w.id).collect();
 
-        // Generate workspace strings
+        // Generate workspace strings and update cache
         let workspaces_strings = self.generate_workspaces_string(workspaces, config);
-
-        // Render the workspaces
-        workspaces_strings.iter().for_each(|(&id, clients)| {
-            rename_cmd(id, clients, &config.format, &config.workspaces_name)
-        });
+        
+        // Get cache lock
+        let mut cache = self.workspace_strings_cache.lock()?;
+        
+        // Update cache and rename only changed workspaces
+        for (&id, new_string) in &workspaces_strings {
+            if cache.get(&id) != Some(new_string) {
+                // Cache miss or different value - update and render
+                rename_cmd(id, new_string, &config.format, &config.workspaces_name);
+                cache.insert(id, new_string.clone());
+            }
+        }
+        
+        // Remove cached entries for workspaces that no longer exist
+        cache.retain(|&id, _| workspace_ids.contains(&id));
 
         Ok(())
     }
@@ -149,6 +164,9 @@ impl Renamer {
     }
 
     pub fn reset_workspaces(&self, config: ConfigFile) -> Result<(), Box<dyn Error + '_>> {
+        // Clear cache when resetting
+        self.workspace_strings_cache.lock()?.clear();
+        
         self.known_workspaces
             .lock()?
             .iter()
@@ -2282,5 +2300,124 @@ mod tests {
         let actual = get_workspace_name(3, &config.workspaces_name);
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_workspace_cache() {
+        let mut config = crate::config::read_config_file(None, false, false).unwrap();
+        config.class.push((Regex::new("kitty").unwrap(), "term".to_string()));
+        
+        let renamer = Renamer::new(
+            Config {
+                cfg_path: None,
+                config: config.clone(),
+            },
+            Args {
+                verbose: false,
+                debug: false,
+                config: None,
+                dump: false,
+                migrate_config: false,
+            },
+        );
+
+        // Initial state - cache should be empty
+        assert_eq!(renamer.workspace_strings_cache.lock().unwrap().len(), 0);
+
+        // Generate workspace strings - should populate cache
+        let workspaces = vec![
+            AppWorkspace {
+                id: 1,
+                clients: vec![AppClient {
+                    initial_class: "kitty".to_string(),
+                    class: "kitty".to_string(),
+                    title: "term1".to_string(),
+                    initial_title: "term1".to_string(),
+                    is_active: false,
+                    is_fullscreen: FullscreenMode::None,
+                    matched_rule: renamer.parse_icon(
+                        "kitty".to_string(),
+                        "kitty".to_string(),
+                        "term1".to_string(),
+                        "term1".to_string(),
+                        false,
+                        &config,
+                    ),
+                    is_dedup_inactive_fullscreen: false,
+                }],
+            },
+            AppWorkspace {
+                id: 2,
+                clients: vec![AppClient {
+                    initial_class: "kitty".to_string(),
+                    class: "kitty".to_string(),
+                    title: "term2".to_string(),
+                    initial_title: "term2".to_string(),
+                    is_active: false,
+                    is_fullscreen: FullscreenMode::None,
+                    matched_rule: renamer.parse_icon(
+                        "kitty".to_string(),
+                        "kitty".to_string(),
+                        "term2".to_string(),
+                        "term2".to_string(),
+                        false,
+                        &config,
+                    ),
+                    is_dedup_inactive_fullscreen: false,
+                }],
+            },
+        ];
+
+        let strings = renamer.generate_workspaces_string(workspaces.clone(), &config);
+        
+        // Cache should now contain entries for both workspaces
+        {
+            let cache = renamer.workspace_strings_cache.lock().unwrap();
+            assert_eq!(cache.len(), 2);
+            assert_eq!(cache.get(&1), strings.get(&1));
+            assert_eq!(cache.get(&2), strings.get(&2));
+        }
+
+        // Generate same workspaces again - should use cache
+        let strings2 = renamer.generate_workspaces_string(workspaces.clone(), &config);
+        assert_eq!(strings, strings2);
+
+        // Generate different workspace set - should update cache
+        let workspaces2 = vec![
+            AppWorkspace {
+                id: 1,
+                clients: vec![AppClient {
+                    initial_class: "kitty".to_string(),
+                    class: "kitty".to_string(),
+                    title: "term3".to_string(), // Different title
+                    initial_title: "term3".to_string(),
+                    is_active: false,
+                    is_fullscreen: FullscreenMode::None,
+                    matched_rule: renamer.parse_icon(
+                        "kitty".to_string(),
+                        "kitty".to_string(),
+                        "term3".to_string(),
+                        "term3".to_string(),
+                        false,
+                        &config,
+                    ),
+                    is_dedup_inactive_fullscreen: false,
+                }],
+            },
+        ];
+
+        let strings3 = renamer.generate_workspaces_string(workspaces2, &config);
+        
+        // Cache should be updated - workspace 2 removed, workspace 1 updated
+        {
+            let cache = renamer.workspace_strings_cache.lock().unwrap();
+            assert_eq!(cache.len(), 1);
+            assert_eq!(cache.get(&1), strings3.get(&1));
+            assert_eq!(cache.get(&2), None);
+        }
+
+        // Test cache reset
+        renamer.reset_workspaces(config.clone()).unwrap();
+        assert_eq!(renamer.workspace_strings_cache.lock().unwrap().len(), 0);
     }
 }
